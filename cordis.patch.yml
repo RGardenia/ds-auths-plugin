@@ -1,0 +1,27 @@
+- id: webserver
+  disabled: true
+
+- insert:
+    - id: dsh-auth
+      name: ds-auths-plugin
+      config:
+        databasePath: !!js process.env.DSH_AUTH_DATABASE_PATH ?? dshHomePath('auth/v1/auth.db')
+        bootstrapToken: !!js process.env.DSH_AUTH_BOOTSTRAP_TOKEN ?? ''
+        bootstrapTtlMs: 900000
+        sessionIdleTtlMs: 28800000
+        sessionAbsoluteTtlMs: 86400000
+
+    - id: auth-webserver
+      name: ds-auths-plugin/webserver
+      inject: [webStartup, authGateway]
+      config:
+        host: !!js process.env.DSH_AUTH_HOST ?? ctx.webStartup.host ?? '127.0.0.1'
+        port: !!js Number(process.env.DSH_AUTH_PORT ?? ctx.webStartup.port ?? 3080)
+        cookieSecure: !!js process.env.DSH_AUTH_COOKIE_SECURE ?? 'auto'
+        trustedHosts: !!js "[...(ctx.webStartup.trustedHosts ?? []), ...(process.env.DSH_AUTH_TRUSTED_HOSTS ?? '').split(',').map(value => value.trim()).filter(Boolean)]"
+
+- id: connection
+  name: '@deepseek-ai/dsh-client-connection'
+  inject: [webRuntime]
+  config:
+    trustedHosts: !!js ctx.webRuntime.trustedHosts

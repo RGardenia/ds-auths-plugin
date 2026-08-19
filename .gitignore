@@ -1,0 +1,17 @@
+node_modules/
+.local/
+references/
+.agents/
+.claude/
+coverage/
+dist/
+*.log
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+.DS_Store
+skills-lock.json
+.with
