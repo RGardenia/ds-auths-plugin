@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { isIP } from 'node:net'
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const host = process.env.HOST ?? '0.0.0.0'
@@ -19,8 +20,8 @@ const trustedHosts = (process.env.DSH_AUTH_TRUSTED_HOSTS ?? process.env.DSH_AUTH
 if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
   throw new Error('PORT must be an integer between 1 and 65535')
 }
-if (host !== '127.0.0.1' && host !== '0.0.0.0') {
-  throw new Error('HOST must be 127.0.0.1 or 0.0.0.0')
+if (isIP(host) === 0 || host.includes('%')) {
+  throw new Error('HOST must be an IPv4 or IPv6 literal without a zone id')
 }
 if (!existsSync(join(root, 'lib', 'index.js')) || !existsSync(join(root, 'lib', 'webserver.js'))) {
   throw new Error('Plugin is not built. Run pnpm build before previewing.')
@@ -74,7 +75,7 @@ if (!pluginInstalled) {
   if (install.status !== 0) process.exit(install.status ?? 1)
 }
 
-const args = [dshEntry, 'web', '--port', String(port)]
+const args = [dshEntry, 'web', '--host', host, '--port', String(port), '--no-open']
 if (trustedHosts.length > 0) args.push('--trusted-host', ...trustedHosts)
 const harness = spawn(runtimeNode, args, {
   cwd: root,

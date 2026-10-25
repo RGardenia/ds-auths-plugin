@@ -36,7 +36,13 @@ export interface LoginInput {
     username: string;
     password: string;
 }
-export type AuthFailureCode = 'AUTH_ALREADY_INITIALIZED' | 'AUTH_BOOTSTRAP_INVALID' | 'AUTH_INVALID_CREDENTIALS' | 'AUTH_INVALID_INPUT' | 'AUTH_NOT_INITIALIZED';
+export interface AccountUpdateInput {
+    currentPassword: string;
+    username: string;
+    displayName: string;
+    password?: string;
+}
+export type AuthFailureCode = 'AUTH_ALREADY_INITIALIZED' | 'AUTH_BOOTSTRAP_INVALID' | 'AUTH_INVALID_CREDENTIALS' | 'AUTH_INVALID_INPUT' | 'AUTH_NOT_INITIALIZED' | 'AUTH_REQUIRED';
 export declare class AuthFailure extends Error {
     readonly code: AuthFailureCode;
     readonly status: number;
@@ -61,6 +67,11 @@ export declare class AuthService {
     authenticate(token: string): Promise<Principal | null>;
     verifyCsrf(token: string, csrfToken: string): boolean;
     logout(token: string): Promise<void>;
+    /** Change account credentials atomically, revoking every old session. */
+    updateAccount(token: string, input: AccountUpdateInput): Promise<{
+        session: AuthSession;
+        revokedSessionIds: string[];
+    }>;
     close(): void;
     private materializeSession;
     private toPrincipal;

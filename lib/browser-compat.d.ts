@@ -1,0 +1,3 @@
+/** crypto.randomUUID is absent on LAN HTTP even when getRandomValues is available. */
+export declare const RANDOM_UUID_POLYFILL = "(()=>{\n  if(typeof globalThis.crypto?.randomUUID==='function')return;\n  if(typeof globalThis.crypto?.getRandomValues!=='function')return;\n  Object.defineProperty(globalThis.crypto,'randomUUID',{configurable:true,value:()=>{\n    const bytes=crypto.getRandomValues(new Uint8Array(16));bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;\n    const hex=Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');\n    return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);\n  }});\n})()";
+//# sourceMappingURL=browser-compat.d.ts.map

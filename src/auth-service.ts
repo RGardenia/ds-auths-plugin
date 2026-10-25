@@ -47,12 +47,20 @@ export interface LoginInput {
   password: string
 }
 
+export interface AccountUpdateInput {
+  currentPassword: string
+  username: string
+  displayName: string
+  password?: string
+}
+
 export type AuthFailureCode =
   | 'AUTH_ALREADY_INITIALIZED'
   | 'AUTH_BOOTSTRAP_INVALID'
   | 'AUTH_INVALID_CREDENTIALS'
   | 'AUTH_INVALID_INPUT'
   | 'AUTH_NOT_INITIALIZED'
+  | 'AUTH_REQUIRED'
 
 const FAILURE_STATUS: Record<AuthFailureCode, number> = {
   AUTH_ALREADY_INITIALIZED: 409,
@@ -60,6 +68,7 @@ const FAILURE_STATUS: Record<AuthFailureCode, number> = {
   AUTH_INVALID_CREDENTIALS: 401,
   AUTH_INVALID_INPUT: 400,
   AUTH_NOT_INITIALIZED: 423,
+  AUTH_REQUIRED: 401,
 }
 
 const FAILURE_MESSAGE: Record<AuthFailureCode, string> = {
@@ -68,6 +77,7 @@ const FAILURE_MESSAGE: Record<AuthFailureCode, string> = {
   AUTH_INVALID_CREDENTIALS: '用户名或密码错误',
   AUTH_INVALID_INPUT: '提交的信息不符合安全要求',
   AUTH_NOT_INITIALIZED: '系统尚未完成安全初始化',
+  AUTH_REQUIRED: '需要重新登录',
 }
 
 const APPLICATION_ID = 0x44534841
@@ -243,8 +253,11 @@ export class AuthService {
     }
     if (this.passwordHasher.needsRehash(user.password_hash)) {
       const upgraded = await this.passwordHasher.hash(input.password)
-      this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(upgraded, user.id)
+      this.db.prepare('UPDATE users SET password_hash = ? WHERE id = ? AND auth_version = ? AND password_hash = ?')
+        .run(upgraded, user.id, user.auth_version, user.password_hash)
     }
+    const current = this.db.prepare('SELECT auth_version FROM users WHERE id = ?').get(user.id) as { auth_version: number } | undefined
+    if (current?.auth_version !== user.auth_version) throw new AuthFailure('AUTH_INVALID_CREDENTIALS')
     const now = this.now()
     const material = newSessionMaterial(now, this.sessionIdleTtlMs, this.sessionAbsoluteTtlMs)
     insertSession(this.db, material, user.id, user.auth_version)
@@ -305,6 +318,41 @@ export class AuthService {
     const row = this.db.prepare('SELECT user_id FROM auth_sessions WHERE id_hash = ?').get(tokenHash) as { user_id: string } | undefined
     this.db.prepare('UPDATE auth_sessions SET revoked_at = ? WHERE id_hash = ? AND revoked_at IS NULL').run(now, tokenHash)
     if (row !== undefined) insertAudit(this.db, row.user_id, 'auth.logout', 'allow', now)
+  }
+
+  /** Change account credentials atomically, revoking every old session. */
+  async updateAccount(token: string, input: AccountUpdateInput): Promise<{ session: AuthSession; revokedSessionIds: string[] }> {
+    const principal = await this.authenticate(token)
+    if (principal === null) throw new AuthFailure('AUTH_REQUIRED')
+    const user = this.db.prepare('SELECT * FROM users WHERE id = ?').get(principal.userId) as UserRow | undefined
+    if (user === undefined) throw new AuthFailure('AUTH_REQUIRED')
+    const normalized = validateIdentityInput(input.username, input.displayName, input.password ?? input.currentPassword)
+    if (!await this.passwordHasher.verify(input.currentPassword, user.password_hash)) {
+      insertAudit(this.db, user.id, 'auth.account.failed', 'deny', this.now())
+      throw new AuthFailure('AUTH_INVALID_CREDENTIALS')
+    }
+    const passwordHash = input.password === undefined ? user.password_hash : await this.passwordHasher.hash(input.password)
+    const current = await this.authenticate(token)
+    if (current === null || current.authVersion !== user.auth_version) throw new AuthFailure('AUTH_REQUIRED')
+    const now = this.now()
+    const material = newSessionMaterial(now, this.sessionIdleTtlMs, this.sessionAbsoluteTtlMs)
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const changed = this.db.prepare(`UPDATE users SET username_norm = ?, display_name = ?, password_hash = ?, auth_version = auth_version + 1
+        WHERE id = ? AND auth_version = ?`).run(normalized.username, normalized.displayName, passwordHash, user.id, user.auth_version)
+      if (changed.changes !== 1) throw new AuthFailure('AUTH_REQUIRED')
+      const revoked = this.db.prepare('SELECT id_hash FROM auth_sessions WHERE user_id = ? AND revoked_at IS NULL').all(user.id) as { id_hash: string }[]
+      this.db.prepare('UPDATE auth_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(now, user.id)
+      insertSession(this.db, material, user.id, user.auth_version + 1)
+      insertAudit(this.db, user.id, 'auth.account.updated', 'allow', now)
+      const updated = { ...user, username_norm: normalized.username, display_name: normalized.displayName, auth_version: user.auth_version + 1 }
+      const session = this.materializeSession(material, updated)
+      this.db.exec('COMMIT')
+      return { session, revokedSessionIds: revoked.map(row => row.id_hash) }
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   close(): void {

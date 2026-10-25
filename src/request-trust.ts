@@ -21,7 +21,7 @@ export function isTrustedRequest(request: TrustRequest, trustedHosts: readonly s
   if (origin === undefined) return true
   const originUrl = parseOrigin(origin)
   return originUrl !== undefined
-    && (originUrl.host === hostUrl.host || matchesTrustedAuthority(originUrl, trustedHosts))
+    && (sameAuthority(originUrl, host) || matchesTrustedAuthority(originUrl, trustedHosts))
 }
 
 export function hasTrustedOrigin(request: TrustRequest, trustedHosts: readonly string[]): boolean {
@@ -32,13 +32,15 @@ export function hasTrustedOrigin(request: TrustRequest, trustedHosts: readonly s
   const hostUrl = parseAuthority(host)
   const originUrl = parseOrigin(origin)
   if (hostUrl === undefined || originUrl === undefined) return false
-  return originUrl.host === hostUrl.host || matchesTrustedAuthority(originUrl, trustedHosts)
+  return sameAuthority(originUrl, host) || matchesTrustedAuthority(originUrl, trustedHosts)
 }
 
 function parseOrigin(origin: string): URL | undefined {
   try {
     const parsed = new URL(origin)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed : undefined
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      && !parsed.username && !parsed.password && parsed.pathname === '/' && !parsed.search && !parsed.hash
+      && origin === parsed.origin ? parsed : undefined
   } catch {
     return undefined
   }
@@ -52,10 +54,17 @@ function header(headers: IncomingHttpHeaders | Headers, name: string): string | 
 
 function parseAuthority(authority: string): URL | undefined {
   try {
-    return new URL(`http://${authority}`)
+    const parsed = new URL(`http://${authority}`)
+    if (!authority || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash
+      || canonicalAuthority(authority, parsed) !== authority.toLowerCase()) return undefined
+    return parsed
   } catch {
     return undefined
   }
+}
+
+function sameAuthority(origin: URL, authority: string): boolean {
+  return new URL(`${origin.protocol}//${authority}`).host === origin.host
 }
 
 function canonicalAuthority(entry: string, parsed: URL): string {
@@ -69,7 +78,8 @@ function matchesTrustedAuthority(host: URL, trustedHosts: readonly string[]): bo
     if (parsed === undefined) return false
     return canonicalAuthority(entry, parsed) === parsed.hostname
       ? parsed.hostname === host.hostname
-      : parsed.host === host.host
+      : parsed.hostname === host.hostname
+        && (new URL(`https://${entry}`).port || parsed.port || '443') === (host.port || (host.protocol === 'https:' ? '443' : '80'))
   })
 }
 

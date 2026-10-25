@@ -1,7 +1,7 @@
 import { Service } from '@deepseek-ai/cordis';
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import { AuthService, type AuthSession, type BootstrapInput, type LoginInput, type Principal } from './auth-service.js';
+import { AuthService, type AuthSession, type AccountUpdateInput, type BootstrapInput, type LoginInput, type Principal } from './auth-service.js';
 export interface Config {
     databasePath: string;
     bootstrapToken: string;
@@ -24,9 +24,10 @@ export declare class AuthGateway extends Service {
     verifyCsrf(token: string, csrfToken: string): boolean;
     logout(token: string): Promise<void>;
     onSessionRevoked(listener: (sessionId: string) => void): () => void;
+    updateAccount(token: string, input: AccountUpdateInput): Promise<AuthSession>;
     private requireService;
 }
-export type { AuthSession, BootstrapInput, LoginInput, Principal };
+export type { AuthSession, AccountUpdateInput, BootstrapInput, LoginInput, Principal };
 export { AuthFailure } from './auth-service.js';
 export { ScryptPasswordHasher, type PasswordHasher } from './password-hasher.js';
 export default AuthGateway;

@@ -49,6 +49,66 @@ async function fixture(): Promise<Fixture> {
 }
 
 describe('AuthAwareWebServer official contract', () => {
+  it('serves master resource routes and Peer-aware index injections behind authentication', async () => {
+    const { context, origin, cookie } = await fixture()
+    const peer = { id: 'peer' }
+    let observedPeer: object | undefined
+    context.on('webserver/index-inject', (rows, currentPeer) => {
+      observedPeer = currentPeer
+      rows.push({ kind: 'global', name: '__DSH_BOOT__', value: { plugins: [] } })
+    })
+    context.webServer.register({ kind: 'exact', path: '/resource', resource: async (request, currentPeer) => {
+      const headers = new Headers({ 'x-resource': 'yes' })
+      headers.append('set-cookie', 'one=1; Path=/')
+      headers.append('set-cookie', 'two=2; Path=/')
+      return new Response(context.webServer.renderIndex(`<head></head><body>${request.method}</body>`, currentPeer), { headers })
+    } })
+    expect((await fetch(`${origin}/resource`)).status).toBe(401)
+    const response = await fetch(`${origin}/resource`, { headers: { cookie } })
+    expect(response.status).toBe(200)
+    expect(response.headers.getSetCookie()).toHaveLength(2)
+    expect(await response.text()).toContain('__DSH_BOOT_READY__')
+    expect(observedPeer).toBeUndefined()
+    const read = await context.webServer.readResource(new Request(`${origin}/resource`), peer)
+    expect(await read.text()).toContain('__DSH_BOOT__')
+    expect(observedPeer).toBe(peer)
+    const head = await fetch(`${origin}/resource`, { method: 'HEAD', headers: { cookie } })
+    expect(head.status).toBe(200)
+    expect(await head.text()).toBe('')
+    const invalid = await fetch(`${origin}/resource`, { method: 'POST', headers: { cookie, origin } })
+    expect(invalid.status).toBe(405)
+    expect(invalid.headers.get('allow')).toBe('GET, HEAD')
+    context.webServer.registerFallback({ resource: async () => new Response('fallback resource') })
+    expect(await (await fetch(`${origin}/fallback`, { headers: { cookie } })).text()).toBe('fallback resource')
+  })
+
+  it('updates credentials with CSRF and current-password checks and revokes old HTTP and upgrade sessions', async () => {
+    const { context, origin, cookie } = await fixture()
+    const csrf = /dsh_csrf_dev=([^;]+)/.exec(cookie)?.[1] ?? ''
+    context.webServer.registerUpgrade({ path: '/events', handler: (_request, socket) => {
+      socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: dsh-test\r\n\r\n')
+    } })
+    const socket = await rawUpgrade(context.webServer.port, '/events', cookie)
+    const closed = once(socket.socket, 'close')
+    const payload = { username: 'owner', displayName: 'Owner', currentPassword: 'correct horse battery staple', password: 'replacement password for owner' }
+    const update = (token: string, body: object) => fetch(`${origin}/auth/v1/account`, {
+      method: 'POST', headers: { cookie, origin, 'content-type': 'application/json', 'x-dsh-csrf': token }, body: JSON.stringify(body),
+    })
+    expect((await update('wrong', payload)).status).toBe(403)
+    expect((await update(csrf, { ...payload, currentPassword: 'incorrect password' })).status).toBe(401)
+    expect((await fetch(`${origin}/auth/account`, { headers: { cookie } })).status).toBe(200)
+    const changed = await update(csrf, payload)
+    expect(changed.status).toBe(200)
+    await closed
+    expect((await fetch(`${origin}/auth/v1/session`, { headers: { cookie } })).status).toBe(401)
+    const replacement = changed.headers.getSetCookie().map(value => value.split(';', 1)[0]).join('; ')
+    const session = await fetch(`${origin}/auth/v1/session`, { headers: { cookie: replacement } })
+    expect(session.status).toBe(200)
+    expect(await session.json()).toMatchObject({ principal: { username: 'owner', displayName: 'Owner' } })
+    await expect(context.authGateway.login({ username: 'admin', password: payload.currentPassword })).rejects.toMatchObject({ code: 'AUTH_INVALID_CREDENTIALS' })
+    await expect(context.authGateway.login({ username: 'owner', password: payload.password })).resolves.toMatchObject({ principal: { username: 'owner' } })
+  })
+
   it('preserves exact, longest-prefix, fallback, index-tap and disposer semantics behind auth', async () => {
     const { context, origin, cookie } = await fixture()
     const server = context.webServer

@@ -5,6 +5,7 @@ import {
   AuthService,
   type AuthServiceOptions,
   type AuthSession,
+  type AccountUpdateInput,
   type BootstrapInput,
   type LoginInput,
   type Principal,
@@ -92,13 +93,21 @@ export class AuthGateway extends Service {
     return () => { this.revocationListeners.delete(listener) }
   }
 
+  async updateAccount(token: string, input: AccountUpdateInput): Promise<AuthSession> {
+    const { session, revokedSessionIds } = await this.requireService().updateAccount(token, input)
+    for (const id of revokedSessionIds) {
+      for (const listener of this.revocationListeners) listener(id)
+    }
+    return session
+  }
+
   private requireService(): AuthService {
     if (this.service === undefined) throw new Error('authGateway is not ready')
     return this.service
   }
 }
 
-export type { AuthSession, BootstrapInput, LoginInput, Principal }
+export type { AuthSession, AccountUpdateInput, BootstrapInput, LoginInput, Principal }
 export { AuthFailure } from './auth-service.js'
 export { ScryptPasswordHasher, type PasswordHasher } from './password-hasher.js'
 export default AuthGateway

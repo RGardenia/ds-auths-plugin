@@ -1,21 +1,31 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { createServer as createSecureServer } from 'node:https'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { isIP, type AddressInfo } from 'node:net'
 import type { Duplex } from 'node:stream'
 import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { AccessGate, readUniqueCookie } from './access-gate.js'
 import type { AuthGateway } from './index.js'
 import { renderAuthPage } from './auth-page.js'
+import { renderAccountPage } from './account-page.js'
 import { principalContext } from './principal-context.js'
 import { FailureRateLimiter, type LoginAttemptKey } from './rate-limiter.js'
 import { assertTrustedAuthority, hasTrustedOrigin, isTrustedRequest } from './request-trust.js'
+import { bridgeBrowserAuthentication, type BrowserConnection } from './browser-bridge.js'
+import { renderIndexInjections, type IndexInjection } from './index-injections.js'
+import { serveResource, type WebResource } from './web-resource.js'
+import { RANDOM_UUID_POLYFILL } from './browser-compat.js'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
     authGateway: AuthGateway
     webServer: AuthAwareWebServer
+  }
+  interface Events {
+    'webserver/index-inject'(table: IndexInjection[], peer?: object): void
   }
 }
 
@@ -32,9 +42,16 @@ export interface WebUpgradeRoute {
   handler: (request: IncomingMessage, socket: Duplex, head: Buffer) => void | Promise<void>
 }
 
+export interface WebResourceRoute {
+  kind: WebRouteKind
+  path: string
+  resource: WebResource
+}
+
 export interface Config {
-  host: '127.0.0.1' | '0.0.0.0'
+  host: string
   port: number
+  tls?: { certFile: string; keyFile: string }
   cookieSecure: 'auto' | 'required' | 'development'
   trustedHosts: string[]
 }
@@ -65,16 +82,21 @@ const MAX_AUTH_BODY_BYTES = 64 * 1024
 export class AuthAwareWebServer extends Service {
   static inject = ['authGateway']
   static Config: z<Config> = z.object({
-    host: z.union([z.const('127.0.0.1'), z.const('0.0.0.0')]).required(),
+    host: z.transform(z.string(), value => {
+      if (isIP(value) === 0 || value.includes('%')) throw new Error('host must be an IPv4 or IPv6 literal without a zone id')
+      return value
+    }).required(),
     port: z.natural().max(65_535).required(),
+    tls: z.object({ certFile: z.string().required(), keyFile: z.string().required() }).default(undefined as never),
     cookieSecure: z.union([z.const('auto'), z.const('required'), z.const('development')]).default('auto'),
     trustedHosts: z.array(z.string()).default([]),
   })
 
-  private readonly exact = new Map<string, WebRoute>()
-  private readonly prefixes = new Map<string, WebRoute>()
+  private readonly exact = new Map<string, WebRoute | WebResourceRoute>()
+  private readonly prefixes = new Map<string, WebRoute | WebResourceRoute>()
   private readonly upgrades = new Map<string, WebUpgradeRoute>()
   private readonly upgradedSockets = new Set<Duplex>()
+  private readonly tlsSockets = new Set<Duplex>()
   private readonly socketsBySession = new Map<string, Set<Duplex>>()
   private readonly indexTaps: ((html: string) => string)[] = []
   private readonly cookiePolicy: CookiePolicy
@@ -97,7 +119,7 @@ export class AuthAwareWebServer extends Service {
     maxDelayMs: 10 * 60_000,
     maxBuckets: 2_000,
   })
-  private fallback: WebRoute['handler'] | undefined
+  private fallback: WebRoute['handler'] | Pick<WebResourceRoute, 'resource'> | undefined
   private server!: Server
   private listenedPort!: number
 
@@ -119,7 +141,16 @@ export class AuthAwareWebServer extends Service {
     return this.config.host
   }
 
-  register(route: WebRoute): () => void {
+  get protocol(): 'http:' | 'https:' {
+    return this.config.tls == null ? 'http:' : 'https:'
+  }
+
+  getOrigin(): string {
+    const host = this.host === '0.0.0.0' ? '127.0.0.1' : this.host === '::' ? '::1' : this.host
+    return `${this.protocol}//${isIP(host) === 6 ? `[${host}]` : host}:${this.port}`
+  }
+
+  register(route: WebRoute | WebResourceRoute): () => void {
     assertRoutePath(route.path, route.kind === 'prefix')
     const table = route.kind === 'exact' ? this.exact : this.prefixes
     if (table.has(route.path)) throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
@@ -134,7 +165,7 @@ export class AuthAwareWebServer extends Service {
     return () => { this.upgrades.delete(route.path) }
   }
 
-  registerFallback(handler: WebRoute['handler']): () => void {
+  registerFallback(handler: WebRoute['handler'] | Pick<WebResourceRoute, 'resource'>): () => void {
     if (this.fallback !== undefined) throw new Error('webserver: fallback already registered')
     this.fallback = handler
     return () => { this.fallback = undefined }
@@ -149,7 +180,29 @@ export class AuthAwareWebServer extends Service {
   }
 
   applyIndexTaps(html: string): string {
-    return this.indexTaps.reduce((output, transform) => transform(output), html)
+    const transformed = this.indexTaps.reduce((output, transform) => transform(output), html)
+    return transformed.replace('</body>', '<a href="/auth/account" aria-label="账号与安全" style="position:fixed;right:16px;bottom:16px;z-index:1000;padding:8px 12px;border-radius:8px;background:Canvas;color:CanvasText;border:1px solid GrayText;font:13px system-ui;text-decoration:none">账号与安全</a></body>')
+  }
+
+  collectIndexInjections(peer?: object): IndexInjection[] {
+    const table: IndexInjection[] = [{ kind: 'script', placement: 'head', text: RANDOM_UUID_POLYFILL }]
+    this.ctx.emit('webserver/index-inject', table, peer)
+    return table
+  }
+
+  renderIndex(html: string, peer?: object): string {
+    return this.applyIndexTaps(renderIndexInjections(html, this.collectIndexInjections(peer)))
+  }
+
+  /** In-process callers admit their own Peer; HTTP always passes the session gate. */
+  async readResource(request: Request, peer: object): Promise<Response> {
+    if (request.method !== 'GET' && request.method !== 'HEAD') return new Response(null, { status: 405, headers: { allow: 'GET, HEAD' } })
+    const route = this.match(new URL(request.url).pathname) ?? this.fallback
+    if (typeof route !== 'object' || !('resource' in route)) return new Response(null, { status: 404 })
+    const response = await route.resource(request, peer)
+    if (request.method !== 'HEAD') return response
+    await response.body?.cancel()
+    return new Response(null, { status: response.status, statusText: response.statusText, headers: response.headers })
   }
 
   protected async [Service.init](): Promise<void> {
@@ -159,7 +212,7 @@ export class AuthAwareWebServer extends Service {
       for (const socket of sockets) socket.destroy()
       this.socketsBySession.delete(sessionId)
     }), 'authAwareWebServer.sessionRevocation')
-    this.server = createServer((request, response) => {
+    const listener = (request: IncomingMessage, response: ServerResponse): void => {
       this.handle(request, response).catch((error: unknown) => {
         this.ctx.logger.warn(error instanceof Error ? error : new Error(String(error)))
         if (response.headersSent) {
@@ -168,29 +221,43 @@ export class AuthAwareWebServer extends Service {
         }
         this.sendProblem(response, error)
       })
-    })
-    this.server.on('upgrade', (request, socket, head) => {
-      void this.handleUpgrade(request, socket, head)
-    })
-    await new Promise<void>((resolve, reject) => {
-      this.server.once('error', reject)
-      this.server.listen(this.config.port, this.config.host, () => {
-        this.server.off('error', reject)
-        this.server.on('error', error => { this.ctx.logger.error(error) })
-        this.listenedPort = (this.server.address() as AddressInfo).port
-        resolve()
+    }
+    await this.ctx.effect(async () => {
+      const tls = this.config.tls
+      if (tls == null) {
+        this.server = createServer(listener)
+      } else {
+        const [cert, key] = await Promise.all([readFile(tls.certFile, 'utf8'), readFile(tls.keyFile, 'utf8')])
+        if (!cert.trim() || !key.trim()) throw new Error('TLS certificate and key must not be empty')
+        this.server = createSecureServer({ cert, key }, listener)
+        this.server.on('connection', socket => {
+          this.tlsSockets.add(socket)
+          socket.once('close', () => { this.tlsSockets.delete(socket) })
+        })
+      }
+      this.server.on('upgrade', (request, socket, head) => {
+        void this.handleUpgrade(request, socket, head)
       })
-    })
-    this.ctx.effect(() => async () => {
-      const serverClosed = new Promise<void>((resolve) => {
-        this.server.close(() => { resolve() })
+      await new Promise<void>((resolve, reject) => {
+        this.server.once('error', reject)
+        this.server.listen(this.config.port, this.config.host, () => {
+          this.server.off('error', reject)
+          this.server.on('error', error => { this.ctx.logger.error(error) })
+          this.listenedPort = (this.server.address() as AddressInfo).port
+          resolve()
+        })
       })
-      this.server.closeAllConnections()
-      const upgradedClosed = [...this.upgradedSockets].map(socket => new Promise<void>((resolve) => {
-        socket.once('close', () => { resolve() })
-        socket.destroy()
-      }))
-      await Promise.all([serverClosed, ...upgradedClosed])
+      return async () => {
+        const serverClosed = new Promise<void>((resolve) => {
+          this.server.close(() => { resolve() })
+        })
+        this.server.closeAllConnections()
+        const upgradedClosed = [...this.upgradedSockets, ...this.tlsSockets].map(socket => new Promise<void>((resolve) => {
+          socket.once('close', () => { resolve() })
+          socket.destroy()
+        }))
+        await Promise.all([serverClosed, ...upgradedClosed])
+      }
     }, 'authAwareWebServer.listen')
   }
 
@@ -219,6 +286,7 @@ export class AuthAwareWebServer extends Service {
     }
     await principalContext.run(decision.principal, async () => {
       if (await this.handleAuthRoute(request, response, decision.token)) return
+      this.bridgeAuthentication(request)
       const pathname = readPathname(request)
       if (pathname === '/auth' || pathname.startsWith('/auth/')) {
         sendJson(response, 404, failureBody('NOT_FOUND', requestId))
@@ -226,7 +294,8 @@ export class AuthAwareWebServer extends Service {
       }
       const route = this.match(pathname)
       if (route !== undefined) {
-        await route.handler(request, response)
+        if ('resource' in route) await serveResource(request, response, route.resource)
+        else await route.handler(request, response)
         return
       }
       if (this.fallback === undefined) {
@@ -234,8 +303,14 @@ export class AuthAwareWebServer extends Service {
         response.end()
         return
       }
-      await this.fallback(request, response)
+      if (typeof this.fallback === 'function') await this.fallback(request, response)
+      else await serveResource(request, response, this.fallback.resource)
     })
+  }
+
+  private bridgeAuthentication(request: IncomingMessage): void {
+    const connection = this.ctx.get('connection') as BrowserConnection | undefined
+    if (connection !== undefined) bridgeBrowserAuthentication(connection, request)
   }
 
   private async handleAuthRoute(
@@ -244,6 +319,14 @@ export class AuthAwareWebServer extends Service {
     sessionToken: string | null,
   ): Promise<boolean> {
     const pathname = readPathname(request)
+    if (pathname === '/auth/account') {
+      requireMethod(request, ['GET', 'HEAD'])
+      const nonce = randomBytes(18).toString('base64url')
+      applySecurityHeaders(response, nonce)
+      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      response.end(request.method === 'HEAD' ? undefined : renderAccountPage(nonce))
+      return true
+    }
     if (pathname === '/auth/login') {
       if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpProblem(405, 'METHOD_NOT_ALLOWED', '仅支持 GET')
       const authenticated = sessionToken !== null || (await this.gate.authenticateRequest(request)) !== null
@@ -325,7 +408,7 @@ export class AuthAwareWebServer extends Service {
       }, request.method === 'HEAD')
       return true
     }
-    if (pathname === '/auth/v1/logout') {
+    if (pathname === '/auth/v1/logout' || pathname === '/auth/v1/account') {
       requireMethod(request, ['POST'])
       if (sessionToken === null) throw new HttpProblem(401, 'AUTH_REQUIRED', '需要登录')
       const csrf = request.headers['x-dsh-csrf']
@@ -337,6 +420,26 @@ export class AuthAwareWebServer extends Service {
         || !this.ctx.authGateway.verifyCsrf(sessionToken, csrf)
       ) {
         throw new HttpProblem(403, 'AUTH_CSRF_REJECTED', '安全校验失败')
+      }
+      if (pathname === '/auth/v1/account') {
+        const body = await readJsonBody(request)
+        const key = authAttemptKey(request, principalContext.require().username)
+        this.requireRateLimit(this.loginLimiter, key)
+        try {
+          const session = await this.ctx.authGateway.updateAccount(sessionToken, {
+            currentPassword: readString(body, 'currentPassword'),
+            username: readString(body, 'username'),
+            displayName: readString(body, 'displayName'),
+            ...(body.password === undefined ? {} : { password: readString(body, 'password') }),
+          })
+          this.loginLimiter.recordSuccess(key)
+          this.setSessionCookies(response, session.token, session.csrfToken, session.absoluteExpiresAt)
+          sendJson(response, 200, { ok: true, principal: publicPrincipal(session.principal) })
+        } catch (error) {
+          if (shouldCountAuthFailure(error)) this.loginLimiter.recordFailure(key)
+          throw error
+        }
+        return true
       }
       await this.ctx.authGateway.logout(sessionToken)
       this.clearSessionCookies(response)
@@ -410,6 +513,7 @@ export class AuthAwareWebServer extends Service {
         rejectUpgrade(socket, 404)
         return
       }
+      this.bridgeAuthentication(request)
       this.upgradedSockets.add(socket)
       let sessionSockets = this.socketsBySession.get(decision.principal.sessionId)
       if (sessionSockets === undefined) {
@@ -428,10 +532,10 @@ export class AuthAwareWebServer extends Service {
     }
   }
 
-  private match(pathname: string): WebRoute | undefined {
+  private match(pathname: string): WebRoute | WebResourceRoute | undefined {
     const exact = this.exact.get(pathname)
     if (exact !== undefined) return exact
-    let best: WebRoute | undefined
+    let best: WebRoute | WebResourceRoute | undefined
     for (const [prefix, route] of this.prefixes) {
       if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
       if (best === undefined || prefix.length > best.path.length) best = route
@@ -462,7 +566,7 @@ function isAuthFailure(error: unknown): error is Error & { code: string; status:
 
 function createCookiePolicy(config: Config): CookiePolicy {
   const secure = config.cookieSecure === 'required'
-    || (config.cookieSecure === 'auto' && (config.host !== '127.0.0.1' || config.trustedHosts.length > 0))
+    || config.tls != null
   return secure
     ? { sessionName: '__Host-dsh_auth', csrfName: '__Host-dsh_csrf', preAuthCsrfName: '__Host-dsh_pre_csrf', secure }
     : { sessionName: 'dsh_auth_dev', csrfName: 'dsh_csrf_dev', preAuthCsrfName: 'dsh_pre_csrf_dev', secure }
